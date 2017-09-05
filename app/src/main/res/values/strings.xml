@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">straightG</string>
+    <string name="label_ok">ok</string>
+    <string name="title_error">Error</string>
+</resources>
