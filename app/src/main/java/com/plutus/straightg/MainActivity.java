@@ -1,5 +1,6 @@
 package com.plutus.straightg;
 
+import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothManager;
 import android.content.ComponentName;
@@ -7,12 +8,16 @@ import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.os.Build;
 import android.os.IBinder;
+import android.support.annotation.NonNull;
 import android.support.v7.app.AlertDialog;
 import android.support.v7.app.AppCompatActivity;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.ViewGroup;
 
+import com.mbientlab.bletoolbox.scanner.BleScannerFragment;
 import com.mbientlab.metawear.AsyncDataProducer;
 import com.mbientlab.metawear.Data;
 import com.mbientlab.metawear.MetaWearBoard;
@@ -26,23 +31,69 @@ import com.mbientlab.metawear.data.Acceleration;
 import com.mbientlab.metawear.module.Accelerometer;
 import com.mbientlab.metawear.module.AccelerometerBosch;
 import com.mbientlab.metawear.module.AccelerometerMma8452q;
+import com.mbientlab.metawear.module.Led;
+import com.mbientlab.metawear.module.Settings;
+
+import java.util.UUID;
 
 import bolts.Continuation;
 import bolts.Task;
+import io.reactivex.functions.Consumer;
 
 import static java.security.AccessController.getContext;
 
-public class MainActivity extends AppCompatActivity implements ServiceConnection {
+public class MainActivity extends AppCompatActivity implements ServiceConnection, BleScannerFragment.ScannerCommunicationBus {
+
+    private final static String TAG = MainActivity.class.getCanonicalName();
+
+    private final static UUID[] serviceUuids;
+
+    static {
+        serviceUuids= new UUID[] {
+                MetaWearBoard.METAWEAR_GATT_SERVICE,
+                MetaWearBoard.METABOOT_SERVICE
+        };
+    }
 
     private static final float[] MMA845Q_RANGES= {2.f, 4.f, 8.f}, BOSCH_RANGES = {2.f, 4.f, 8.f, 16.f};
     private static final float INITIAL_RANGE= 2.f, ACC_FREQ= 50.f;
 
     //TODO: change
-    private final String MW_MAC_ADDRESS= "EC:2C:09:81:22:AC";
+    private final String MW_MAC_ADDRESS= "DC:AE:23:CA:D4:27";
+    //private final String MW_MAC_ADDRESS= "CD:09:3C:13:42:7A";
     private BtleService.LocalBinder serviceBinder;
     private MetaWearBoard mwBoard;
     private boolean boardReady;
     private Accelerometer accelerometer;
+    private Detector detector;
+    private long lastVibrateTime;
+
+    private Led led;
+
+    static void setConnInterval(Settings settings) {
+        if (settings != null) {
+            Settings.BleConnectionParametersEditor editor = settings.editBleConnParams();
+            if (editor != null) {
+                editor.maxConnectionInterval(Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? 11.25f : 7.5f)
+                        .commit();
+            }
+        }
+    }
+
+    public static Task<Void> reconnect(final MetaWearBoard board) {
+        return board.connectAsync()
+                .continueWithTask(new Continuation<Void, Task<Void>>() {
+                    @Override
+                    public Task<Void> then(Task<Void> task) throws Exception {
+                        if (task.isFaulted()) {
+                            return reconnect(board);
+                        } else if (task.isCancelled()) {
+                            return task;
+                        }
+                        return Task.forResult(null);
+                    }
+                });
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -52,6 +103,11 @@ public class MainActivity extends AppCompatActivity implements ServiceConnection
         ///< Bind the service when the activity is created
         getApplicationContext().bindService(new Intent(this, BtleService.class),
                 this, Context.BIND_AUTO_CREATE);
+
+        BluetoothAdapter btAdapter=
+                ((BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE)).getAdapter();
+        assert(btAdapter != null && btAdapter.isEnabled());
+
     }
 
 
@@ -64,8 +120,34 @@ public class MainActivity extends AppCompatActivity implements ServiceConnection
 
         // Create a MetaWear board object for the Bluetooth Device
         mwBoard = serviceBinder.getMetaWearBoard(remoteDevice);
-        boardReady= true;
-        boardReady();
+
+        mwBoard.connectAsync()
+                .continueWithTask(new Continuation<Void, Task<Void>>() {
+                    @Override
+                    public Task then(Task task) throws Exception {
+                        if (task.isCancelled()) {
+                            return task;
+                        }
+                        return task.isFaulted() ? reconnect(mwBoard) : Task.forResult(null);
+                    }
+                })
+                .continueWith(new Continuation<Void, Object>() {
+                    @Override
+                    public Object then(Task<Void> task) throws Exception {
+                        if (!task.isCancelled()) {
+                            setConnInterval(mwBoard.getModule(Settings.class));
+                            Log.i(TAG,"Connected");
+                            runOnUiThread(new Runnable() {
+                                @Override
+                                public void run() {
+                                    boardReady= true;
+                                    boardReady();
+                                }
+                            });
+                        }
+                        return null;
+                    }
+                });
     }
 
     @Override
@@ -81,8 +163,6 @@ public class MainActivity extends AppCompatActivity implements ServiceConnection
     public void onServiceConnected(ComponentName name, IBinder service) {
         ///< Typecast the binder to the service's LocalBinder class
         serviceBinder = (BtleService.LocalBinder) service;
-
-        initBoard();
 
     }
 
@@ -123,7 +203,7 @@ public class MainActivity extends AppCompatActivity implements ServiceConnection
             editor.range(MMA845Q_RANGES[rangeIndex]);
         }
         editor.commit();
-
+        detector = new Detector();
         final float samplePeriod = 1 / accelerometer.getOdr();
 
         final AsyncDataProducer producer = accelerometer.packedAcceleration() == null ?
@@ -140,6 +220,8 @@ public class MainActivity extends AppCompatActivity implements ServiceConnection
                         float x = value.x();
                         float y = value.y();
                         float z = value.z();
+
+                        detector.onNewData(new AccData(x,y,z));
                     }
                 });
             }
@@ -150,6 +232,38 @@ public class MainActivity extends AppCompatActivity implements ServiceConnection
                 producer.start();
                 accelerometer.start();
                 return null;
+            }
+        });
+
+        detector.getFlowable().subscribe(new Consumer<AccResult>() {
+            @Override
+            public void accept(@io.reactivex.annotations.NonNull AccResult result) throws Exception {
+                final float BUFFER_THRESHOLD = 5;
+
+                boolean xOverThreshold = Math.abs(result.deltaX) > BUFFER_THRESHOLD;
+                boolean yOverThreshold = Math.abs(result.deltaY) > BUFFER_THRESHOLD;
+                float deltaDelta = Math.abs(result.deltaY) - Math.abs(result.deltaX);
+
+                Log.i(TAG+"DATA",result.toString());
+                if (xOverThreshold && yOverThreshold) {
+                    if (Math.abs(result.deltaY) * 1.5 <= Math.abs(result.deltaX)) {
+                        if (System.currentTimeMillis() - lastVibrateTime >= 2000) {
+                       /*           *//**//*  handler = new Timer();
+                            timer.scheduleTask(new Timer.Task() {
+                                @Override
+                                public void run() {
+                                    drawRed = false;
+                                }
+                            }, 0.5f);*//**//*
+                        }*/
+                            setLedColor(true);
+                            Log.i("BAD ACCDATA", result.toString());
+                        } else {
+                            setLedColor(false);
+                            Log.i("GOOD ACCDATA", result.toString());
+                        }
+                    }
+                }
             }
         });
     }
@@ -165,4 +279,41 @@ public class MainActivity extends AppCompatActivity implements ServiceConnection
         }
     }
 
+    public void stopLed() {
+        try {
+            led.stop(true);
+        } catch (Exception ignored) {
+
+        }
+    }
+
+    public void setLedColor(boolean isRed) {
+        try {
+            led = mwBoard.getModule(Led.class);
+            if(isRed) {
+                led.editPattern(Led.Color.RED);
+            } else {
+                led.editPattern(Led.Color.GREEN);
+            }
+
+            led.play();
+        } catch (Exception e) {
+            Log.i(TAG,"Error setting led color");
+        }
+    }
+
+    @Override
+    public UUID[] getFilterServiceUuids() {
+        return serviceUuids;
+    }
+
+    @Override
+    public long getScanDuration() {
+        return 10000L;
+    }
+
+    @Override
+    public void onDeviceSelected(BluetoothDevice device) {
+        initBoard();
+    }
 }

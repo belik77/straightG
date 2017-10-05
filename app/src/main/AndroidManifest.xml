@@ -2,6 +2,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.plutus.straightg" >
 
+
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+
+
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
@@ -19,6 +24,7 @@
 
         <service android:name="com.mbientlab.metawear.android.BtleService" />
         <!-- Other application info below i.e. activity definitions -->
+
 
     </application>
 
